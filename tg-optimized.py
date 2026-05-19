@@ -1,0 +1,893 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+"""
+tg_reconcile_engine.py
+
+Enterprise AWS Target Group Live Sync / Reconciliation Engine
+
+Purpose:
+- Compare source AWS ELBv2 Target Groups live against target AWS ELBv2 Target Groups.
+- Use an --info-file that contains source/target account, profile, region, and VPC metadata.
+- Create missing target groups in the target VPC.
+- Update mutable target group health-check settings.
+- Update selected target group attributes.
+- Optionally sync tags.
+- Report immutable drift that cannot be safely changed in place.
+- Support report-only, dry-run, and explicit apply mode.
+- Run post-apply validation after --yes.
+
+Important:
+- This tool does NOT register targets. Instance IDs, IPs, ECS tasks, Lambda ARNs, and Auto Scaling registrations are environment-specific.
+- This tool does NOT delete target groups.
+- This tool does NOT modify immutable target group fields in place.
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
+
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+DEFAULT_REPORT_DIR = "tg_reports"
+DEFAULT_ROLLBACK_DIR = "tg_rollback"
+DEFAULT_MAX_PREVIEW_ITEMS = 50
+
+BOTO_CONFIG = Config(
+    retries={
+        "mode": "adaptive",
+        "max_attempts": 10,
+    }
+)
+
+SUPPORTED_ATTR_KEYS = [
+    "deregistration_delay.timeout_seconds",
+    "stickiness.enabled",
+    "stickiness.type",
+    "stickiness.lb_cookie.duration_seconds",
+    "slow_start.duration_seconds",
+    "load_balancing.algorithm.type",
+    "load_balancing.cross_zone.enabled",
+    "target_group_health.dns_failover.minimum_healthy_targets.count",
+    "target_group_health.dns_failover.minimum_healthy_targets.percentage",
+    "target_group_health.unhealthy_state_routing.minimum_healthy_targets.count",
+    "target_group_health.unhealthy_state_routing.minimum_healthy_targets.percentage",
+]
+
+IMMUTABLE_FIELDS = [
+    "Protocol",
+    "Port",
+    "TargetType",
+    "IpAddressType",
+    "ProtocolVersion",
+]
+
+MUTABLE_FIELDS = [
+    "HealthCheckProtocol",
+    "HealthCheckPort",
+    "HealthCheckEnabled",
+    "HealthCheckPath",
+    "HealthCheckIntervalSeconds",
+    "HealthCheckTimeoutSeconds",
+    "HealthyThresholdCount",
+    "UnhealthyThresholdCount",
+    "Matcher",
+]
+
+INTEGER_MUTABLE_FIELDS = {
+    "HealthCheckIntervalSeconds",
+    "HealthCheckTimeoutSeconds",
+    "HealthyThresholdCount",
+    "UnhealthyThresholdCount",
+}
+
+SYSTEM_TAG_PREFIXES = ("aws:",)
+
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def eprint(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+# =============================================================================
+# UTILS
+# =============================================================================
+
+def utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def now_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+
+def ensure_dir(path: str) -> None:
+    if path:
+        os.makedirs(path, exist_ok=True)
+
+
+def read_json(path: str) -> Any:
+    abs_path = os.path.abspath(os.path.join(os.getcwd(), path))
+    with open(abs_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_json(path: str, data: Any) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        ensure_dir(parent)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, default=str)
+
+
+def normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    value = value.strip().lower()
+    value = value.replace("\u2011", "-").replace("\u2013", "-").replace("\u2014", "-")
+    value = re.sub(r"[^a-z0-9]+", "-", value)
+    value = re.sub(r"-+", "-", value)
+    return value.strip("-")
+
+
+def normalize_name_for_match(name: Optional[str]) -> str:
+    if not name:
+        return ""
+
+    value = normalize_text(name)
+    tokens = [
+        t for t in value.split("-")
+        if t not in {"prod", "production", "prd", "dr", "dev", "qa", "uat", "test", "stage", "staging"}
+    ]
+
+    value = "-".join(tokens)
+    value = re.sub(r"-[a-z0-9]{6,12}$", "", value)
+    value = re.sub(r"-+", "-", value)
+    return value.strip("-")
+
+
+def clean_tags(tags: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    cleaned: List[Dict[str, str]] = []
+    seen = set()
+
+    for tag in tags or []:
+        key = tag.get("Key")
+        value = tag.get("Value", "")
+
+        if not key:
+            continue
+        if key.startswith(SYSTEM_TAG_PREFIXES):
+            continue
+        if key in seen:
+            continue
+
+        seen.add(key)
+        cleaned.append({"Key": key, "Value": value})
+
+    return cleaned
+
+
+def tag_dict(tags: List[Dict[str, str]]) -> Dict[str, str]:
+    return {t["Key"]: t.get("Value", "") for t in clean_tags(tags or []) if t.get("Key")}
+
+
+def normalize_matcher(matcher: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    if not matcher:
+        return {}
+
+    out: Dict[str, str] = {}
+
+    if matcher.get("HttpCode") is not None:
+        out["HttpCode"] = str(matcher["HttpCode"]).replace(" ", "")
+
+    if matcher.get("GrpcCode") is not None:
+        out["GrpcCode"] = str(matcher["GrpcCode"]).replace(" ", "")
+
+    return out
+
+
+def normalize_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: normalize_value(v) for k, v in sorted(value.items()) if v is not None and v != {}}
+    if isinstance(value, list):
+        return [normalize_value(v) for v in value]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if value is None:
+        return None
+    return str(value)
+
+
+# =============================================================================
+# MODELS
+# =============================================================================
+
+@dataclass
+class Environment:
+    profile: Optional[str]
+    region: str
+    vpc_id: str
+    account_id: Optional[str] = None
+    role_arn: Optional[str] = None
+
+
+@dataclass
+class ConfigFile:
+    source: Environment
+    target: Environment
+
+
+@dataclass
+class Args:
+    info_file: str
+    dry_run: bool
+    report_only: bool
+    yes: bool
+    allow_legacy: bool
+    no_create_missing: bool
+    no_sync_tags: bool
+    report_path: str
+    report_dir: str
+    rollback_dir: str
+    max_preview_items: int
+
+
+@dataclass
+class TargetGroupState:
+    name: str
+    arn: Optional[str]
+    vpc_id: Optional[str]
+    fields: Dict[str, Any]
+    attributes: Dict[str, str]
+    tags: Dict[str, str]
+
+
+@dataclass
+class FieldDrift:
+    field: str
+    source_value: Any
+    target_value: Any
+
+
+@dataclass
+class AuditResult:
+    name: str
+    source_arn: Optional[str] = None
+    target_arn: Optional[str] = None
+    exists: bool = False
+    immutable_match: bool = True
+    mutable_match: bool = True
+    attribute_match: bool = True
+    tag_match: bool = True
+    immutable_drift: List[FieldDrift] = field(default_factory=list)
+    mutable_drift: List[FieldDrift] = field(default_factory=list)
+    attribute_drift: List[FieldDrift] = field(default_factory=list)
+    tag_drift: List[FieldDrift] = field(default_factory=list)
+    action: str = "SKIP"
+    notes: List[str] = field(default_factory=list)
+
+    @property
+    def in_sync(self) -> bool:
+        return (
+            self.exists
+            and self.immutable_match
+            and self.mutable_match
+            and self.attribute_match
+            and self.tag_match
+        )
+
+    @property
+    def requires_create(self) -> bool:
+        return not self.exists
+
+    @property
+    def requires_update(self) -> bool:
+        return self.exists and (bool(self.mutable_drift) or bool(self.attribute_drift) or bool(self.tag_drift))
+
+
+@dataclass
+class ExecutionContext:
+    created_target_groups: List[str] = field(default_factory=list)
+    updated_target_groups: List[str] = field(default_factory=list)
+    failed_target_groups: List[str] = field(default_factory=list)
+    rollback_actions: List[Dict[str, Any]] = field(default_factory=list)
+
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
+def load_config(path: str) -> ConfigFile:
+    data = read_json(path)
+
+    if "source" not in data or "target" not in data:
+        raise ValueError("Info file must include top-level 'source' and 'target' objects.")
+
+    return ConfigFile(
+        source=Environment(**data["source"]),
+        target=Environment(**data["target"]),
+    )
+
+
+# =============================================================================
+# AWS CLIENTS
+# =============================================================================
+
+def build_session(env: Environment) -> boto3.Session:
+    if env.profile:
+        base = boto3.Session(profile_name=env.profile, region_name=env.region)
+    else:
+        base = boto3.Session(region_name=env.region)
+
+    if not env.role_arn:
+        return base
+
+    sts = base.client("sts", config=BOTO_CONFIG)
+    resp = sts.assume_role(RoleArn=env.role_arn, RoleSessionName=f"tg-reconcile-{now_stamp()}")
+    creds = resp["Credentials"]
+
+    return boto3.Session(
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+        region_name=env.region,
+    )
+
+
+def get_elbv2(env: Environment) -> Any:
+    return build_session(env).client("elbv2", config=BOTO_CONFIG)
+
+
+# =============================================================================
+# DISCOVERY
+# =============================================================================
+
+def describe_target_groups_by_vpc(elbv2: Any, vpc_id: str) -> List[Dict[str, Any]]:
+    paginator = elbv2.get_paginator("describe_target_groups")
+    out: List[Dict[str, Any]] = []
+
+    for page in paginator.paginate(PageSize=400):
+        for tg in page.get("TargetGroups", []):
+            if tg.get("VpcId") == vpc_id:
+                out.append(tg)
+
+    return out
+
+
+def describe_target_group_attributes(elbv2: Any, tg_arn: str) -> Dict[str, str]:
+    resp = elbv2.describe_target_group_attributes(TargetGroupArn=tg_arn)
+    return {
+        item["Key"]: item.get("Value", "")
+        for item in resp.get("Attributes", [])
+        if item.get("Key") in SUPPORTED_ATTR_KEYS
+    }
+
+
+def describe_target_group_tags(elbv2: Any, tg_arn: str) -> Dict[str, str]:
+    try:
+        resp = elbv2.describe_tags(ResourceArns=[tg_arn])
+        descriptions = resp.get("TagDescriptions", [])
+        if not descriptions:
+            return {}
+        return tag_dict(descriptions[0].get("Tags", []))
+    except ClientError as exc:
+        eprint(f"[WARN] Could not read tags for {tg_arn}: {exc}")
+        return {}
+
+
+def normalize_target_group(tg: Dict[str, Any], attrs: Dict[str, str], tags: Dict[str, str]) -> TargetGroupState:
+    fields = {
+        "TargetGroupName": tg.get("TargetGroupName"),
+        "Protocol": tg.get("Protocol"),
+        "Port": tg.get("Port"),
+        "TargetType": tg.get("TargetType"),
+        "IpAddressType": tg.get("IpAddressType"),
+        "ProtocolVersion": tg.get("ProtocolVersion"),
+        "HealthCheckProtocol": tg.get("HealthCheckProtocol"),
+        "HealthCheckPort": tg.get("HealthCheckPort"),
+        "HealthCheckEnabled": tg.get("HealthCheckEnabled"),
+        "HealthCheckPath": tg.get("HealthCheckPath"),
+        "HealthCheckIntervalSeconds": tg.get("HealthCheckIntervalSeconds"),
+        "HealthCheckTimeoutSeconds": tg.get("HealthCheckTimeoutSeconds"),
+        "HealthyThresholdCount": tg.get("HealthyThresholdCount"),
+        "UnhealthyThresholdCount": tg.get("UnhealthyThresholdCount"),
+        "Matcher": normalize_matcher(tg.get("Matcher")),
+    }
+    fields = {k: normalize_value(v) for k, v in fields.items() if v is not None and v != {}}
+    return TargetGroupState(
+        name=tg["TargetGroupName"],
+        arn=tg.get("TargetGroupArn"),
+        vpc_id=tg.get("VpcId"),
+        fields=fields,
+        attributes={k: str(v) for k, v in sorted((attrs or {}).items())},
+        tags={k: str(v) for k, v in sorted((tags or {}).items())},
+    )
+
+
+def discover_target_groups(env: Environment) -> Dict[str, TargetGroupState]:
+    elbv2 = get_elbv2(env)
+    raw_tgs = describe_target_groups_by_vpc(elbv2, env.vpc_id)
+    result: Dict[str, TargetGroupState] = {}
+
+    for tg in raw_tgs:
+        arn = tg["TargetGroupArn"]
+        attrs = describe_target_group_attributes(elbv2, arn)
+        tags = describe_target_group_tags(elbv2, arn)
+        state = normalize_target_group(tg, attrs, tags)
+        result[state.name] = state
+
+    return result
+
+
+# =============================================================================
+# DIFF / PLAN
+# =============================================================================
+
+def diff_fields(source: Dict[str, Any], target: Dict[str, Any], fields: List[str]) -> List[FieldDrift]:
+    drifts: List[FieldDrift] = []
+    for field_name in fields:
+        src = normalize_value(source.get(field_name))
+        tgt = normalize_value(target.get(field_name))
+        if src != tgt:
+            drifts.append(FieldDrift(field=field_name, source_value=src, target_value=tgt))
+    return drifts
+
+
+def diff_dict(source: Dict[str, str], target: Dict[str, str], keys: Optional[List[str]] = None) -> List[FieldDrift]:
+    compare_keys = sorted(set(keys)) if keys is not None else sorted(set(source.keys()) | set(target.keys()))
+    drifts: List[FieldDrift] = []
+    for key in compare_keys:
+        src = source.get(key)
+        tgt = target.get(key)
+        if src != tgt:
+            drifts.append(FieldDrift(field=key, source_value=src, target_value=tgt))
+    return drifts
+
+
+def audit_target_group(desired: TargetGroupState, live: Optional[TargetGroupState]) -> AuditResult:
+    result = AuditResult(name=desired.name, source_arn=desired.arn, target_arn=live.arn if live else None)
+
+    if not live:
+        result.exists = False
+        result.action = "CREATE"
+        result.notes.append("Missing in target environment.")
+        return result
+
+    result.exists = True
+    immutable_drift = diff_fields(desired.fields, live.fields, IMMUTABLE_FIELDS)
+    mutable_drift = diff_fields(desired.fields, live.fields, MUTABLE_FIELDS)
+    attribute_drift = diff_dict(desired.attributes, live.attributes, SUPPORTED_ATTR_KEYS)
+    tag_drift = diff_dict(desired.tags, live.tags)
+
+    if immutable_drift:
+        result.immutable_match = False
+        result.immutable_drift.extend(immutable_drift)
+        result.notes.append("Immutable drift detected. This tool reports it but does not recreate target groups automatically.")
+
+    if mutable_drift:
+        result.mutable_match = False
+        result.mutable_drift.extend(mutable_drift)
+
+    if attribute_drift:
+        result.attribute_match = False
+        result.attribute_drift.extend(attribute_drift)
+
+    if tag_drift:
+        result.tag_match = False
+        result.tag_drift.extend(tag_drift)
+
+    if result.requires_update:
+        result.action = "UPDATE"
+    elif not result.immutable_match:
+        result.action = "MANUAL_REVIEW"
+    else:
+        result.action = "SKIP"
+
+    return result
+
+
+def build_audit_plan(
+    source_tgs: Dict[str, TargetGroupState],
+    target_tgs: Dict[str, TargetGroupState],
+    allow_legacy: bool,
+) -> Tuple[List[AuditResult], Dict[str, str], List[Dict[str, Any]]]:
+    normalized_target_index: Dict[str, List[str]] = {}
+    for name in target_tgs:
+        normalized_target_index.setdefault(normalize_name_for_match(name), []).append(name)
+
+    results: List[AuditResult] = []
+    match_map: Dict[str, str] = {}
+    ambiguous: List[Dict[str, Any]] = []
+
+    for src_name, desired in sorted(source_tgs.items()):
+        live: Optional[TargetGroupState] = None
+        target_name: Optional[str] = None
+
+        if src_name in target_tgs:
+            target_name = src_name
+            live = target_tgs[src_name]
+        elif allow_legacy:
+            candidates = normalized_target_index.get(normalize_name_for_match(src_name), [])
+            if len(candidates) == 1:
+                target_name = candidates[0]
+                live = target_tgs[target_name]
+            elif len(candidates) > 1:
+                ambiguous.append({"source": src_name, "normalized": normalize_name_for_match(src_name), "candidates": candidates})
+
+        if target_name:
+            match_map[src_name] = target_name
+
+        results.append(audit_target_group(desired, live))
+
+    return results, match_map, ambiguous
+
+
+# =============================================================================
+# MUTATION HELPERS
+# =============================================================================
+
+def _coerce_mutable_field(key: str, value: Any) -> Any:
+    if key in INTEGER_MUTABLE_FIELDS and value is not None:
+        return int(value)
+    return value
+
+
+def create_target_group(elbv2: Any, desired: TargetGroupState, target_vpc_id: str, dry_run: bool, sync_tags: bool) -> Optional[str]:
+    name = desired.name
+    payload: Dict[str, Any] = {
+        "Name": name,
+        "Protocol": desired.fields["Protocol"],
+        "Port": int(desired.fields["Port"]),
+        "VpcId": target_vpc_id,
+        "TargetType": desired.fields.get("TargetType", "instance"),
+    }
+
+    for key in ["ProtocolVersion", "IpAddressType"]:
+        if desired.fields.get(key):
+            payload[key] = desired.fields[key]
+
+    for key in MUTABLE_FIELDS:
+        value = desired.fields.get(key)
+        if value is None or value == {}:
+            continue
+        payload[key] = _coerce_mutable_field(key, value)
+
+    if sync_tags and desired.tags:
+        payload["Tags"] = [{"Key": k, "Value": v} for k, v in sorted(desired.tags.items())]
+
+    if dry_run:
+        log(f"[DRY-RUN] Would create target group: {name}")
+        return None
+
+    try:
+        resp = elbv2.create_target_group(**payload)
+        arn = resp["TargetGroups"][0]["TargetGroupArn"]
+        log(f"[CREATE] {name} -> {arn}")
+        if desired.attributes:
+            modify_target_group_attributes(elbv2, arn, desired.attributes, dry_run=False)
+        return arn
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"DuplicateTargetGroupName", "TargetGroupAlreadyExists"}:
+            log(f"[INFO] Target group already exists by name: {name}")
+            return None
+        raise
+
+
+def build_mutable_payload(desired: TargetGroupState, audit: AuditResult, target_arn: str) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"TargetGroupArn": target_arn}
+    drift_fields = {d.field for d in audit.mutable_drift}
+    for key in MUTABLE_FIELDS:
+        if key not in drift_fields:
+            continue
+        value = desired.fields.get(key)
+        if value is None or value == {}:
+            continue
+        payload[key] = _coerce_mutable_field(key, value)
+    return payload
+
+
+def modify_target_group(elbv2: Any, desired: TargetGroupState, audit: AuditResult, dry_run: bool) -> None:
+    target_arn = audit.target_arn
+    if not target_arn:
+        eprint(f"[ERROR] Missing TargetGroupArn for {audit.name}")
+        return
+    payload = build_mutable_payload(desired, audit, target_arn)
+    if len(payload) == 1:
+        return
+    if dry_run:
+        log(f"[DRY-RUN] Would modify target group settings: {audit.name}")
+        return
+    elbv2.modify_target_group(**payload)
+    log(f"[MODIFY] Updated mutable settings for {audit.name}")
+
+
+def modify_target_group_attributes(
+    elbv2: Any,
+    target_arn: str,
+    desired_attrs: Dict[str, str],
+    dry_run: bool,
+    drift_keys: Optional[List[str]] = None,
+) -> None:
+    if not desired_attrs:
+        return
+    keys = sorted(set(drift_keys)) if drift_keys is not None else sorted(desired_attrs.keys())
+    attributes = [{"Key": key, "Value": desired_attrs[key]} for key in keys if key in desired_attrs]
+    if not attributes:
+        return
+    if dry_run:
+        log(f"[DRY-RUN] Would modify target group attributes: {target_arn} ({', '.join([a['Key'] for a in attributes])})")
+        return
+    elbv2.modify_target_group_attributes(TargetGroupArn=target_arn, Attributes=attributes)
+    log(f"[ATTRIBUTES] Updated {len(attributes)} attribute(s) on {target_arn}")
+
+
+def sync_target_group_tags(elbv2: Any, audit: AuditResult, desired: TargetGroupState, dry_run: bool) -> None:
+    if not desired.tags:
+        return
+    if not audit.target_arn:
+        eprint(f"[ERROR] Missing TargetGroupArn for tag sync: {audit.name}")
+        return
+    tags = [{"Key": k, "Value": v} for k, v in sorted(desired.tags.items())]
+    if dry_run:
+        log(f"[DRY-RUN] Would sync {len(tags)} tag(s) for target group: {audit.name}")
+        return
+    elbv2.add_tags(ResourceArns=[audit.target_arn], Tags=tags)
+    log(f"[TAGS] Synced {len(tags)} tag(s) for {audit.name}")
+
+
+# =============================================================================
+# REPORTING
+# =============================================================================
+
+def audit_summary(results: List[AuditResult], ambiguous: List[Dict[str, Any]]) -> Dict[str, Any]:
+    return {
+        "total_source_target_groups": len(results),
+        "in_sync": len([r for r in results if r.in_sync]),
+        "create": len([r for r in results if r.action == "CREATE"]),
+        "update": len([r for r in results if r.action == "UPDATE"]),
+        "manual_review": len([r for r in results if r.action == "MANUAL_REVIEW"]),
+        "skip": len([r for r in results if r.action == "SKIP"]),
+        "ambiguous_matches": len(ambiguous),
+    }
+
+
+def result_to_dict(result: AuditResult) -> Dict[str, Any]:
+    data = asdict(result)
+    data["in_sync"] = result.in_sync
+    data["requires_create"] = result.requires_create
+    data["requires_update"] = result.requires_update
+    return data
+
+
+def build_report_payload(
+    args: Args,
+    config: ConfigFile,
+    results: List[AuditResult],
+    match_map: Dict[str, str],
+    ambiguous: List[Dict[str, Any]],
+    context: Optional[ExecutionContext],
+    post_apply_validation: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    return {
+        "created_at_utc": utc_now_iso(),
+        "mode": {"dry_run": args.dry_run, "report_only": args.report_only, "yes": args.yes},
+        "source": asdict(config.source),
+        "target": asdict(config.target),
+        "summary": audit_summary(results, ambiguous),
+        "matches": match_map,
+        "ambiguous_matches": ambiguous,
+        "results": [result_to_dict(r) for r in results],
+        "execution": {
+            "created_target_groups": context.created_target_groups if context else [],
+            "updated_target_groups": context.updated_target_groups if context else [],
+            "failed_target_groups": context.failed_target_groups if context else [],
+            "rollback_actions_count": len(context.rollback_actions) if context else 0,
+            "rollback_actions": context.rollback_actions if context else [],
+        },
+        "post_apply_validation": post_apply_validation or {
+            "enabled": False,
+            "status": "NOT_RUN",
+            "passed": None,
+            "reason": "Post-apply validation only runs after --yes apply mode.",
+        },
+    }
+
+
+def resolve_report_path(args: Args, config: ConfigFile) -> str:
+    if args.report_path:
+        return args.report_path
+    ensure_dir(args.report_dir)
+    mode = "dryrun" if args.dry_run else "apply" if args.yes else "report"
+    return os.path.join(args.report_dir, f"tg_reconcile_{mode}_{config.target.profile or 'default'}_{config.target.region}_{now_stamp()}.json")
+
+
+def print_report(results: List[AuditResult], ambiguous: List[Dict[str, Any]]) -> None:
+    summary = audit_summary(results, ambiguous)
+    print("\n" + "=" * 90)
+    print("TARGET GROUP RECONCILIATION REPORT")
+    print("=" * 90)
+    for key, value in summary.items():
+        print(f"{key:28}: {value}")
+
+    if ambiguous:
+        print("\n[AMBIGUOUS MATCHES]")
+        for item in ambiguous:
+            print(f" - {item['source']} -> {item['candidates']}")
+
+    attention = [r for r in results if not r.in_sync]
+    if not attention:
+        print("\nAll target groups are in sync.")
+        print("=" * 90)
+        return
+
+    for r in attention:
+        print("\n" + "-" * 90)
+        print(f"TG: {r.name}")
+        print(f"Action        : {r.action}")
+        print(f"Exists        : {r.exists}")
+        print(f"Immutable     : {'OK' if r.immutable_match else 'DRIFT'}")
+        print(f"Mutable       : {'OK' if r.mutable_match else 'DRIFT'}")
+        print(f"Attributes    : {'OK' if r.attribute_match else 'DRIFT'}")
+        print(f"Tags          : {'OK' if r.tag_match else 'DRIFT'}")
+        for title, drifts in [("Immutable drift", r.immutable_drift), ("Mutable drift", r.mutable_drift), ("Attribute drift", r.attribute_drift), ("Tag drift", r.tag_drift)]:
+            if not drifts:
+                continue
+            print(f"{title}:")
+            for drift in drifts:
+                print(f"  - {drift.field}: source={drift.source_value!r}, target={drift.target_value!r}")
+        if r.notes:
+            print("Notes:")
+            for note in r.notes:
+                print(f"  - {note}")
+    print("=" * 90)
+
+
+# =============================================================================
+# EXECUTION
+# =============================================================================
+
+def execute_plan(args: Args, config: ConfigFile, source_tgs: Dict[str, TargetGroupState], results: List[AuditResult]) -> ExecutionContext:
+    context = ExecutionContext()
+    target_elbv2 = get_elbv2(config.target)
+    log("\n================ TARGET GROUP EXECUTION START ================")
+
+    for audit in results:
+        desired = source_tgs.get(audit.name)
+        if not desired:
+            continue
+        if audit.action == "SKIP":
+            continue
+        if audit.action == "MANUAL_REVIEW":
+            log(f"[MANUAL-REVIEW] Immutable drift for {audit.name}; no automatic action taken.")
+            continue
+        try:
+            if audit.action == "CREATE":
+                if args.no_create_missing:
+                    log(f"[SKIP] Missing TG creation disabled for {audit.name}")
+                    continue
+                arn = create_target_group(target_elbv2, desired, config.target.vpc_id, args.dry_run, sync_tags=not args.no_sync_tags)
+                if arn:
+                    context.created_target_groups.append(audit.name)
+                    context.rollback_actions.append({"operation": "delete_target_group", "target_group_arn": arn, "target_group_name": audit.name})
+                continue
+            if audit.action == "UPDATE":
+                if audit.mutable_drift:
+                    modify_target_group(target_elbv2, desired, audit, args.dry_run)
+                if audit.attribute_drift and audit.target_arn:
+                    drift_keys = [d.field for d in audit.attribute_drift]
+                    modify_target_group_attributes(target_elbv2, audit.target_arn, desired.attributes, args.dry_run, drift_keys=drift_keys)
+                if audit.tag_drift and not args.no_sync_tags:
+                    sync_target_group_tags(target_elbv2, audit, desired, args.dry_run)
+                context.updated_target_groups.append(audit.name)
+        except ClientError as exc:
+            eprint(f"[ERROR] Failed applying action for {audit.name}: {exc}")
+            context.failed_target_groups.append(audit.name)
+
+    log("================ TARGET GROUP EXECUTION COMPLETE ================\n")
+    return context
+
+
+def run_post_apply_validation(args: Args, config: ConfigFile) -> Dict[str, Any]:
+    log("\n================ POST-APPLY VALIDATION START ================")
+    source_tgs = discover_target_groups(config.source)
+    target_tgs = discover_target_groups(config.target)
+    results, match_map, ambiguous = build_audit_plan(source_tgs, target_tgs, allow_legacy=args.allow_legacy)
+    summary = audit_summary(results, ambiguous)
+    passed = summary["create"] == 0 and summary["update"] == 0 and summary["manual_review"] == 0 and summary["ambiguous_matches"] == 0
+    status = "PASSED" if passed else "FAILED"
+    log(f"[POST-APPLY-VALIDATION] status={status}, create={summary['create']}, update={summary['update']}, manual_review={summary['manual_review']}, ambiguous={summary['ambiguous_matches']}")
+    log("================ POST-APPLY VALIDATION COMPLETE ================\n")
+    return {"enabled": True, "status": status, "passed": passed, "summary": summary, "matches": match_map, "ambiguous_matches": ambiguous, "results": [result_to_dict(r) for r in results]}
+
+
+# =============================================================================
+# ARGS
+# =============================================================================
+
+def parse_args() -> Args:
+    parser = argparse.ArgumentParser(description="Enterprise AWS Target Group Reconciliation Engine")
+    parser.add_argument("--info-file", required=True, help="Path to target group source/target config JSON")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true", help="Preview actions without modifying AWS")
+    mode.add_argument("--report-only", action="store_true", help="Build report only; do not execute actions")
+    mode.add_argument("--yes", action="store_true", help="Apply changes and run post-apply validation")
+    parser.add_argument("--allow-legacy", action="store_true", help="Allow normalized-name fallback matching")
+    parser.add_argument("--no-create-missing", action="store_true", help="Do not create missing target groups")
+    parser.add_argument("--no-sync-tags", action="store_true", help="Do not sync target group tags")
+    parser.add_argument("--report-path", default="", help="Optional explicit report output path")
+    parser.add_argument("--report-dir", default=DEFAULT_REPORT_DIR, help="Report directory")
+    parser.add_argument("--rollback-dir", default=DEFAULT_ROLLBACK_DIR, help="Rollback journal directory")
+    parser.add_argument("--max-preview-items", type=int, default=DEFAULT_MAX_PREVIEW_ITEMS)
+    ns = parser.parse_args()
+    if not ns.dry_run and not ns.report_only and not ns.yes:
+        ns.dry_run = True
+    return Args(ns.info_file, ns.dry_run, ns.report_only, ns.yes, ns.allow_legacy, ns.no_create_missing, ns.no_sync_tags, ns.report_path, ns.report_dir, ns.rollback_dir, ns.max_preview_items)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+def main() -> int:
+    args = parse_args()
+    try:
+        log("\n============================================================")
+        log(" Enterprise AWS Target Group Reconciliation Engine")
+        log("============================================================")
+        config = load_config(args.info_file)
+        log(f"[SOURCE] profile={config.source.profile}, region={config.source.region}, vpc={config.source.vpc_id}")
+        log(f"[TARGET] profile={config.target.profile}, region={config.target.region}, vpc={config.target.vpc_id}")
+        log("[INFO] Discovering source target groups")
+        source_tgs = discover_target_groups(config.source)
+        log(f"[SOURCE] Loaded {len(source_tgs)} target group(s)")
+        log("[INFO] Discovering target target groups")
+        target_tgs = discover_target_groups(config.target)
+        log(f"[TARGET] Loaded {len(target_tgs)} target group(s)")
+        results, match_map, ambiguous = build_audit_plan(source_tgs, target_tgs, allow_legacy=args.allow_legacy)
+        print_report(results, ambiguous)
+        context: Optional[ExecutionContext] = None
+        post_apply_validation: Optional[Dict[str, Any]] = None
+        if args.report_only:
+            log("[REPORT-ONLY] No execution will be attempted.")
+        else:
+            context = execute_plan(args, config, source_tgs, results)
+            if args.yes:
+                post_apply_validation = run_post_apply_validation(args, config)
+        report_payload = build_report_payload(args, config, results, match_map, ambiguous, context, post_apply_validation)
+        report_path = resolve_report_path(args, config)
+        write_json(report_path, report_payload)
+        log(f"[REPORT] Written: {report_path}")
+        log("[DONE] Target group reconciliation complete.")
+        return 0
+    except KeyboardInterrupt:
+        eprint("\n[ABORTED] Interrupted by user.")
+        return 130
+    except Exception as exc:
+        eprint(f"\n[FATAL] {exc}")
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
