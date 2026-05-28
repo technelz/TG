@@ -1,0 +1,26 @@
+{
+  "source": {
+    "profile": "default",
+    "region": "us-west-2",
+    "vpc_id": "vpc-03ee9c7eb53a70f6c"
+  },
+  "target": {
+    "profile": "dr-cadbo",
+    "region": "us-east-1",
+    "vpc_id": "vpc-07960651bc9c19fa5"
+  },
+  "policy": {
+    "register_targets": false,
+    "create_missing_load_balancers": false,
+    "create_missing_target_groups": true,
+    "sync_load_balancer_attributes": true,
+    "sync_target_group_attributes": true,
+    "sync_target_group_settings": true,
+    "sync_listener_rules": true,
+    "sync_listeners": true,
+    "sync_tags": true,
+    "allow_extra_target_rules": true,
+    "skip_target_registration": true,
+    "allow_certificate_domain_match": true
+  }
+}

@@ -1,45 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-"""
-elbv2_reconcile_engine.py
-
-Enterprise AWS ELBv2 / Target Group / Listener / Listener Rule
-Prod-to-DR Live Reconciliation Engine
-
-Purpose:
-- Compare source AWS ELBv2 routing chain against target AWS ELBv2 routing chain.
-- Discover resources dynamically across accounts/regions/VPCs.
-- Reconcile the usable DR routing path, not only standalone target groups.
-
-Validated/Synced domains:
-- Target groups
-- Target group mutable health-check fields
-- Target group selected attributes
-- Target group source-required tags
-- Load balancer existence and mutable attributes
-- ALB/NLB listeners
-- Listener default actions
-- Listener rules and conditions
-- Listener rule forward actions remapped from source TG ARN to target TG ARN
-- Listener certificates remapped dynamically by domain/SAN where possible
-
-Important:
-- This tool does NOT register targets by default.
-- This tool does NOT delete target groups.
-- This tool does NOT delete load balancers.
-- This tool does NOT recreate immutable resources automatically.
-- This tool assumes DR EC2/ECS/IP targets may not exist yet.
-- Missing registered targets are SKIPPED/WARN only when --skip-target-registration is enabled.
-
-Recommended workflow:
-1. Run --dry-run first.
-2. Review JSON report.
-3. Run --yes only after review.
-4. Validate AWS Console routing chain:
-   Load Balancer -> Listener -> Rule -> Target Group.
-"""
-
 import argparse
 import json
 import os
@@ -83,9 +44,11 @@ TG_SUPPORTED_ATTR_KEYS = [
 ]
 
 LB_SUPPORTED_ATTR_KEYS = [
-    "access_logs.s3.enabled",
-    "access_logs.s3.bucket",
-    "access_logs.s3.prefix",
+    # REMOVE these three lines for cold DR:
+    # "access_logs.s3.enabled",
+    # "access_logs.s3.bucket",
+    # "access_logs.s3.prefix",
+
     "deletion_protection.enabled",
     "idle_timeout.timeout_seconds",
     "routing.http.desync_mitigation_mode",
@@ -133,7 +96,23 @@ LB_IMMUTABLE_FIELDS = [
     "IpAddressType",
 ]
 
-SYSTEM_TAG_PREFIXES = ("aws:",)
+SYSTEM_TAG_PREFIXES = (
+    "aws:",
+    "elasticbeanstalk:",
+    "kubernetes.io/",
+    "eks:",
+    "aws:cloudformation:",
+    "aws:autoscaling:",
+)
+
+# If non-empty, only these keys are considered "important true tags".
+ALLOWED_TAG_KEYS: Set[str] = {
+    "Name",
+    "Environment",
+    "Owner",
+    "CostCenter",
+    "Application",
+}
 
 
 # =============================================================================
@@ -200,7 +179,7 @@ def normalize_name_for_match(name: Optional[str]) -> str:
             "prod", "production", "prd",
             "dr", "disaster", "recovery",
             "dev", "qa", "uat", "test", "stage", "staging",
-            "blue", "green"
+            "blue", "green",
         }
     ]
 
@@ -231,6 +210,8 @@ def clean_tags(tags: List[Dict[str, str]]) -> List[Dict[str, str]]:
         if not key:
             continue
         if key.startswith(SYSTEM_TAG_PREFIXES):
+            continue
+        if ALLOWED_TAG_KEYS and key not in ALLOWED_TAG_KEYS:
             continue
         if key in seen:
             continue
@@ -732,90 +713,6 @@ def normalize_load_balancer(lb: Dict[str, Any], attrs: Dict[str, str], tags: Dic
     )
 
 
-def normalize_listener(listener: Dict[str, Any]) -> ListenerState:
-    certs = [c.get("CertificateArn") for c in listener.get("Certificates", []) if c.get("CertificateArn")]
-    return ListenerState(
-        arn=listener["ListenerArn"],
-        load_balancer_arn=listener["LoadBalancerArn"],
-        port=int(listener["Port"]),
-        protocol=listener["Protocol"],
-        ssl_policy=listener.get("SslPolicy"),
-        certificates=sorted(certs),
-        default_actions=canonicalize_actions(listener.get("DefaultActions", [])),
-    )
-
-
-def normalize_listener_rule(rule: Dict[str, Any]) -> ListenerRuleState:
-    priority = str(rule.get("Priority", ""))
-    return ListenerRuleState(
-        arn=rule["RuleArn"],
-        listener_arn=rule["ListenerArn"],
-        priority=priority,
-        conditions=canonicalize_conditions(rule.get("Conditions", [])),
-        actions=canonicalize_actions(rule.get("Actions", [])),
-        is_default=(priority == "default"),
-    )
-
-
-def discover_world(env: Environment) -> WorldState:
-    elbv2 = get_elbv2(env)
-
-    raw_lbs = describe_load_balancers_by_vpc(elbv2, env.vpc_id)
-    lb_arns = [lb["LoadBalancerArn"] for lb in raw_lbs if lb.get("LoadBalancerArn")]
-    lb_tags_by_arn = describe_tags(elbv2, lb_arns)
-
-    lbs: Dict[str, LoadBalancerState] = {}
-    lbs_by_arn: Dict[str, LoadBalancerState] = {}
-    listeners: Dict[str, ListenerState] = {}
-    listener_rules: Dict[str, List[ListenerRuleState]] = {}
-
-    for lb in raw_lbs:
-        lb_arn = lb.get("LoadBalancerArn")
-        attrs = describe_lb_attributes(elbv2, lb_arn) if lb_arn else {}
-        state = normalize_load_balancer(lb, attrs, lb_tags_by_arn.get(lb_arn, {}))
-        lbs[state.name] = state
-        lbs_by_arn[state.arn] = state
-
-        for listener in describe_listeners_for_lb(elbv2, state.arn):
-            ls = normalize_listener(listener)
-            listeners[ls.arn] = ls
-            listener_rules[ls.arn] = [normalize_listener_rule(r) for r in describe_rules_for_listener(elbv2, ls.arn)]
-
-    raw_tgs = describe_target_groups_by_vpc(elbv2, env.vpc_id)
-    tg_arns = [tg["TargetGroupArn"] for tg in raw_tgs if tg.get("TargetGroupArn")]
-    tg_tags_by_arn = describe_tags(elbv2, tg_arns)
-
-    tgs: Dict[str, TargetGroupState] = {}
-    tgs_by_arn: Dict[str, TargetGroupState] = {}
-
-    for tg in raw_tgs:
-        arn = tg.get("TargetGroupArn")
-        if not arn:
-            continue
-        attrs = describe_target_group_attributes(elbv2, arn)
-        health_count = describe_target_health_count(elbv2, arn)
-        state = normalize_target_group(tg, attrs, tg_tags_by_arn.get(arn, {}), health_count)
-        tgs[state.name] = state
-        if state.arn:
-            tgs_by_arn[state.arn] = state
-
-    certs = discover_certificates(env)
-
-    return WorldState(
-        target_groups=tgs,
-        target_groups_by_arn=tgs_by_arn,
-        load_balancers=lbs,
-        load_balancers_by_arn=lbs_by_arn,
-        listeners=listeners,
-        listener_rules=listener_rules,
-        certificates=certs,
-    )
-
-
-# =============================================================================
-# CANONICALIZATION
-# =============================================================================
-
 def strip_aws_generated_keys(obj: Any) -> Any:
     if isinstance(obj, dict):
         ignored = {
@@ -845,14 +742,102 @@ def canonicalize_actions(actions: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(clean, key=lambda x: json.dumps(x, sort_keys=True))
 
 
-def listener_key(listener: ListenerState) -> str:
-    return f"{listener.protocol}:{listener.port}"
+def normalize_listener(listener: Dict[str, Any]) -> Optional[ListenerState]:
+    arn = listener.get("ListenerArn")
+    lb_arn = listener.get("LoadBalancerArn")
+    if not arn or not lb_arn:
+        eprint(f"[WARN] Skipping listener with missing ARN or LoadBalancerArn: {listener}")
+        return None
+
+    certs = [c.get("CertificateArn") for c in listener.get("Certificates", []) if c.get("CertificateArn")]
+    return ListenerState(
+        arn=arn,
+        load_balancer_arn=lb_arn,
+        port=int(listener.get("Port", 0)),
+        protocol=listener.get("Protocol", ""),
+        ssl_policy=listener.get("SslPolicy"),
+        certificates=sorted(certs),
+        default_actions=canonicalize_actions(listener.get("DefaultActions", [])),
+    )
 
 
-def rule_key(rule: ListenerRuleState) -> str:
-    if rule.is_default:
-        return "default"
-    return json.dumps(rule.conditions, sort_keys=True)
+def normalize_listener_rule(rule: Dict[str, Any]) -> Optional[ListenerRuleState]:
+    arn = rule.get("RuleArn")
+    listener_arn = rule.get("ListenerArn")
+    if not arn or not listener_arn:
+        eprint(f"[WARN] Skipping rule with missing ARN or ListenerArn: {rule}")
+        return None
+
+    priority = str(rule.get("Priority", ""))
+    return ListenerRuleState(
+        arn=arn,
+        listener_arn=listener_arn,
+        priority=priority,
+        conditions=canonicalize_conditions(rule.get("Conditions", [])),
+        actions=canonicalize_actions(rule.get("Actions", [])),
+        is_default=(priority == "default"),
+    )
+
+
+def discover_world(env: Environment) -> WorldState:
+    elbv2 = get_elbv2(env)
+
+    raw_lbs = describe_load_balancers_by_vpc(elbv2, env.vpc_id)
+    lb_arns = [lb["LoadBalancerArn"] for lb in raw_lbs if lb.get("LoadBalancerArn")]
+    lb_tags_by_arn = describe_tags(elbv2, lb_arns)
+
+    lbs: Dict[str, LoadBalancerState] = {}
+    lbs_by_arn: Dict[str, LoadBalancerState] = {}
+    listeners: Dict[str, ListenerState] = {}
+    listener_rules: Dict[str, List[ListenerRuleState]] = {}
+
+    for lb in raw_lbs:
+        lb_arn = lb.get("LoadBalancerArn")
+        attrs = describe_lb_attributes(elbv2, lb_arn) if lb_arn else {}
+        state = normalize_load_balancer(lb, attrs, lb_tags_by_arn.get(lb_arn, {}))
+        lbs[state.name] = state
+        lbs_by_arn[state.arn] = state
+
+        for listener in describe_listeners_for_lb(elbv2, state.arn):
+            ls = normalize_listener(listener)
+            if not ls:
+                continue
+            listeners[ls.arn] = ls
+            rules: List[ListenerRuleState] = []
+            for r in describe_rules_for_listener(elbv2, ls.arn):
+                nr = normalize_listener_rule(r)
+                if nr:
+                    rules.append(nr)
+            listener_rules[ls.arn] = rules
+
+    raw_tgs = describe_target_groups_by_vpc(elbv2, env.vpc_id)
+    tg_arns = [tg["TargetGroupArn"] for tg in raw_tgs if tg.get("TargetGroupArn")]
+    tg_tags_by_arn = describe_tags(elbv2, tg_arns)
+
+    tgs: Dict[str, TargetGroupState] = {}
+    tgs_by_arn: Dict[str, TargetGroupState] = {}
+
+    for tg in raw_tgs:
+        arn = tg.get("TargetGroupArn")
+        if not arn:
+            continue
+        attrs = describe_target_group_attributes(elbv2, arn)
+        health_count = describe_target_health_count(elbv2, arn)
+        state = normalize_target_group(tg, attrs, tg_tags_by_arn.get(arn, {}), health_count)
+        tgs[state.name] = state
+        tgs_by_arn[state.arn] = state
+
+    certs = discover_certificates(env)
+
+    return WorldState(
+        target_groups=tgs,
+        target_groups_by_arn=tgs_by_arn,
+        load_balancers=lbs,
+        load_balancers_by_arn=lbs_by_arn,
+        listeners=listeners,
+        listener_rules=listener_rules,
+        certificates=certs,
+    )
 
 
 # =============================================================================
@@ -934,7 +919,44 @@ def match_by_name(
     return None
 
 
-def build_match_context(source: WorldState, target: WorldState, allow_legacy: bool) -> MatchContext:
+def build_cert_match_map(
+    source_certs: Dict[str, CertificateState],
+    target_certs: Dict[str, CertificateState],
+    allow_domain_match: bool,
+) -> Dict[str, str]:
+    if not allow_domain_match:
+        return {}
+
+    target_domain_index: Dict[str, List[CertificateState]] = {}
+
+    for cert in target_certs.values():
+        if cert.status != "ISSUED":
+            continue
+        for domain in cert.domains:
+            target_domain_index.setdefault(domain, []).append(cert)
+
+    out: Dict[str, str] = {}
+
+    for src_arn, src_cert in source_certs.items():
+        candidates: List[CertificateState] = []
+        for domain in src_cert.domains:
+            candidates.extend(target_domain_index.get(domain, []))
+
+        unique = {c.arn: c for c in candidates}
+        if not unique:
+            continue
+
+        selected = sorted(
+            unique.values(),
+            key=lambda c: c.not_after or "",
+            reverse=True,
+        )[0]
+        out[src_arn] = selected.arn
+
+    return out
+
+
+def build_match_context(source: WorldState, target: WorldState, allow_legacy: bool, policy: Policy) -> MatchContext:
     ctx = MatchContext()
 
     target_tg_norm = build_normalized_index(list(target.target_groups.keys()))
@@ -958,41 +980,13 @@ def build_match_context(source: WorldState, target: WorldState, allow_legacy: bo
         else:
             ctx.unmatched.append({"resource_type": "load_balancer", "source": src_name})
 
-    ctx.cert_source_to_target_arn = build_cert_match_map(source.certificates, target.certificates)
+    ctx.cert_source_to_target_arn = build_cert_match_map(
+        source.certificates,
+        target.certificates,
+        allow_domain_match=policy.allow_certificate_domain_match,
+    )
 
     return ctx
-
-
-def build_cert_match_map(source_certs: Dict[str, CertificateState], target_certs: Dict[str, CertificateState]) -> Dict[str, str]:
-    target_domain_index: Dict[str, List[CertificateState]] = {}
-
-    for cert in target_certs.values():
-        if cert.status != "ISSUED":
-            continue
-        for domain in cert.domains:
-            target_domain_index.setdefault(domain, []).append(cert)
-
-    out: Dict[str, str] = {}
-
-    for src_arn, src_cert in source_certs.items():
-        candidates: List[CertificateState] = []
-        for domain in src_cert.domains:
-            candidates.extend(target_domain_index.get(domain, []))
-
-        unique = {c.arn: c for c in candidates}
-        if not unique:
-            continue
-
-        # Prefer cert with farthest NotAfter date if available.
-        selected = sorted(
-            unique.values(),
-            key=lambda c: c.not_after or "",
-            reverse=True
-        )[0]
-        out[src_arn] = selected.arn
-
-    return out
-
 
 # =============================================================================
 # REMAPPING
@@ -1154,9 +1148,44 @@ def audit_target_groups(source: WorldState, target: WorldState, ctx: MatchContex
     return audits
 
 
+def listener_key(listener: ListenerState) -> str:
+    return f"{listener.protocol}:{listener.port}"
+
+
+def rule_key(rule: ListenerRuleState) -> str:
+    if rule.is_default:
+        return "default"
+    return json.dumps(rule.conditions, sort_keys=True)
+
+
 def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: MatchContext, policy: Policy) -> Tuple[List[ResourceAudit], List[ResourceAudit]]:
     listener_audits: List[ResourceAudit] = []
     rule_audits: List[ResourceAudit] = []
+
+    # Helper for hybrid certificate display
+    def _hybrid_cert_name_from_arn(arn: str) -> str:
+        """Return domain + ARN suffix for readability."""
+        suffix = arn.split("/")[-1]
+
+        # Find cert in source
+        cert = None
+        for c in source.certificates.values():
+            if c.arn == arn:
+                cert = c
+                break
+
+        if not cert:
+            return suffix
+
+        domain = getattr(cert, "DomainName", None)
+        sans = getattr(cert, "SubjectAlternativeNames", [])
+
+        if domain:
+            return f"{domain} ({suffix})"
+        if sans:
+            return f"{sans[0]} ({suffix})"
+
+        return suffix
 
     target_listener_index_by_lb: Dict[str, Dict[str, ListenerState]] = {}
     for listener in target.listeners.values():
@@ -1178,7 +1207,28 @@ def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: Match
                 exists=bool(tgt_listener),
             )
 
+            # ---------------------------------------------------------
+            # CERTIFICATE REMAP + HYBRID DISPLAY PATCH
+            # ---------------------------------------------------------
             desired_cert_arns, cert_notes = remap_certificates(src_listener.certificates, ctx)
+
+            new_cert_notes = []
+            for note in cert_notes:
+                arn = None
+                for token in note.split():
+                    if token.startswith("arn:aws:acm:"):
+                        arn = token
+                        break
+
+                if arn:
+                    hybrid = _hybrid_cert_name_from_arn(arn)
+                    new_cert_notes.append(note.replace(arn, hybrid))
+                else:
+                    new_cert_notes.append(note)
+
+            cert_notes = new_cert_notes
+            # ---------------------------------------------------------
+
             desired_actions, action_notes = remap_actions(src_listener.default_actions, ctx)
 
             for n in cert_notes + action_notes:
@@ -1272,7 +1322,7 @@ def _coerce_tg_mutable_field(key: str, value: Any) -> Any:
     return value
 
 
-def create_target_group(elbv2: Any, desired: TargetGroupState, target_vpc_id: str, dry_run: bool, sync_tags: bool) -> Optional[str]:
+def create_target_group(elbv2: Any, desired: TargetGroupState, target_vpc_id: str, dry_run: bool, sync_tags_flag: bool) -> Optional[str]:
     name = desired.name
     payload: Dict[str, Any] = {
         "Name": name,
@@ -1292,7 +1342,7 @@ def create_target_group(elbv2: Any, desired: TargetGroupState, target_vpc_id: st
             continue
         payload[key] = _coerce_tg_mutable_field(key, value)
 
-    if sync_tags and desired.tags:
+    if sync_tags_flag and desired.tags:
         payload["Tags"] = [{"Key": k, "Value": v} for k, v in sorted(desired.tags.items())]
 
     if dry_run:
@@ -1515,6 +1565,22 @@ def create_or_update_rule(
 # EXECUTION
 # =============================================================================
 
+def effective_policy(args: Args, policy: Policy) -> Policy:
+    p = Policy(**asdict(policy))
+    if args.no_create_missing_tg:
+        p.create_missing_target_groups = False
+    if args.no_create_missing_lb:
+        p.create_missing_load_balancers = False
+    if args.no_sync_tags:
+        p.sync_tags = False
+    if args.no_sync_listener_rules:
+        p.sync_listener_rules = False
+    if args.skip_target_registration:
+        p.skip_target_registration = True
+        p.register_targets = False
+    return p
+
+
 def execute_plan(
     args: Args,
     config: ConfigFile,
@@ -1532,7 +1598,7 @@ def execute_plan(
 
     log("\n================ ELBV2 EXECUTION START ================")
 
-    # 1. Target Groups first, because listeners/rules need target TG ARNs.
+    # 1. Target Groups
     for audit in tg_audits:
         desired = source.target_groups.get(audit.name)
         if not desired:
@@ -1543,7 +1609,7 @@ def execute_plan(
                 if args.no_create_missing_tg or not policy.create_missing_target_groups:
                     log(f"[SKIP] Missing TG creation disabled for {audit.name}")
                     continue
-                arn = create_target_group(elbv2, desired, config.target.vpc_id, args.dry_run, sync_tags=not args.no_sync_tags and policy.sync_tags)
+                arn = create_target_group(elbv2, desired, config.target.vpc_id, args.dry_run, sync_tags_flag=not args.no_sync_tags and policy.sync_tags)
                 if arn:
                     context.created_target_groups.append(audit.name)
                     context.rollback_actions.append({"operation": "delete_target_group", "target_group_arn": arn, "target_group_name": audit.name})
@@ -1563,12 +1629,12 @@ def execute_plan(
             eprint(f"[ERROR] Failed TG action for {audit.name}: {exc}")
             context.failed_actions.append({"resource_type": "target_group", "name": audit.name, "error": str(exc)})
 
-    # Refresh state after TG creation before listener/rule execution.
+    # Refresh state after TG creation
     if any(a.action == "CREATE" for a in tg_audits) and not args.dry_run:
         target = discover_world(config.target)
-        ctx = build_match_context(source, target, allow_legacy=args.allow_legacy)
+        ctx = build_match_context(source, target, allow_legacy=args.allow_legacy, policy=policy)
 
-    # 2. Load balancer mutable attributes/tags only. LB creation remains intentionally conservative.
+    # 2. Load balancers
     for audit in lb_audits:
         src_lb = source.load_balancers.get(audit.name)
         target_arn = audit.target_arn
@@ -1591,12 +1657,8 @@ def execute_plan(
             eprint(f"[ERROR] Failed LB action for {audit.name}: {exc}")
             context.failed_actions.append({"resource_type": "load_balancer", "name": audit.name, "error": str(exc)})
 
-    # 3. Listeners.
+    # 3. Listeners
     if policy.sync_listeners:
-        target_listener_index_by_lb: Dict[str, Dict[str, ListenerState]] = {}
-        for listener in target.listeners.values():
-            target_listener_index_by_lb.setdefault(listener.load_balancer_arn, {})[listener_key(listener)] = listener
-
         for audit in listener_audits:
             if audit.action not in {"CREATE", "UPDATE"}:
                 continue
@@ -1624,12 +1686,12 @@ def execute_plan(
                 eprint(f"[ERROR] Failed listener action for {audit.name}: {exc}")
                 context.failed_actions.append({"resource_type": "listener", "name": audit.name, "error": str(exc)})
 
-    # Refresh listeners after changes before rules.
+    # Refresh listeners after changes
     if listener_audits and not args.dry_run:
         target = discover_world(config.target)
-        ctx = build_match_context(source, target, allow_legacy=args.allow_legacy)
+        ctx = build_match_context(source, target, allow_legacy=args.allow_legacy, policy=policy)
 
-    # 4. Listener rules.
+    # 4. Listener rules
     if policy.sync_listener_rules:
         target_listener_index_by_lb: Dict[str, Dict[str, ListenerState]] = {}
         for listener in target.listeners.values():
@@ -1685,26 +1747,9 @@ def execute_plan(
     log("================ ELBV2 EXECUTION COMPLETE ================\n")
     return context
 
-
 # =============================================================================
 # REPORTING
 # =============================================================================
-
-def effective_policy(args: Args, policy: Policy) -> Policy:
-    p = Policy(**asdict(policy))
-    if args.no_create_missing_tg:
-        p.create_missing_target_groups = False
-    if args.no_create_missing_lb:
-        p.create_missing_load_balancers = False
-    if args.no_sync_tags:
-        p.sync_tags = False
-    if args.no_sync_listener_rules:
-        p.sync_listener_rules = False
-    if args.skip_target_registration:
-        p.skip_target_registration = True
-        p.register_targets = False
-    return p
-
 
 def audit_summary(
     tg: List[TargetGroupAudit],
@@ -1744,14 +1789,26 @@ def resource_to_dict(item: Any) -> Dict[str, Any]:
 
 
 def resolve_report_path(args: Args, config: ConfigFile) -> str:
+    # If user explicitly provided a path, use it as-is
     if args.report_path:
         return args.report_path
+
+    # Ensure the directory exists
     ensure_dir(args.report_dir)
+
+    # Determine mode for filename
     mode = "dryrun" if args.dry_run else "apply" if args.yes else "report"
-    return os.path.join(
-        args.report_dir,
-        f"elbv2_reconcile_{mode}_{config.target.profile or 'default'}_{config.target.region}_{now_stamp()}.json"
+
+    # Build timestamped filename
+    filename = (
+        f"elbv2_reconcile_{mode}_"
+        f"{config.target.profile or 'default'}_"
+        f"{config.target.region}_"
+        f"{now_stamp()}.json"
     )
+
+    # Full path inside the report directory
+    return os.path.join(args.report_dir, filename)
 
 
 def print_report(
@@ -1891,7 +1948,7 @@ def run_post_apply_validation(args: Args, config: ConfigFile) -> Dict[str, Any]:
     source = discover_world(config.source)
     target = discover_world(config.target)
     policy = effective_policy(args, config.policy)
-    ctx = build_match_context(source, target, allow_legacy=args.allow_legacy)
+    ctx = build_match_context(source, target, allow_legacy=args.allow_legacy, policy=policy)
 
     tg = audit_target_groups(source, target, ctx, policy)
     lb = audit_load_balancers(source, target, ctx, policy)
@@ -1971,6 +2028,98 @@ def parse_args() -> Args:
     )
 
 
+def write_human_report(
+    path: str,
+    summary: Dict[str, Any],
+    tg_audits: List[Any],
+    lb_audits: List[Any],
+    listener_audits: List[Any],
+    rule_audits: List[Any],
+    ctx: Any,
+) -> None:
+    lines = []
+
+    # Header
+    lines.append("ELBv2 DR RECONCILIATION – HUMAN READABLE REPORT")
+    lines.append("=" * 70)
+    lines.append(f"Created: {utc_now_iso()}")
+    lines.append("")
+
+    # Executive Summary
+    lines.append("EXECUTIVE SUMMARY")
+    lines.append("-" * 70)
+    lines.append(f"Target Groups: {summary['target_groups_in_sync']}/{summary['target_groups_total']} in sync")
+    lines.append(f"Load Balancers: {summary['load_balancers_in_sync']}/{summary['load_balancers_total']} in sync")
+    lines.append(f"Listeners: {summary['listeners_in_sync']}/{summary['listeners_total']} in sync")
+    lines.append(f"Manual Review Required: {summary['manual_review_total']}")
+    lines.append(f"Ambiguous Matches: {summary['ambiguous_matches']}")
+    lines.append(f"Unmatched Resources: {summary['unmatched_resources']}")
+    lines.append("")
+
+    # Target Groups
+    lines.append("TARGET GROUPS")
+    lines.append("-" * 70)
+    for tg in tg_audits:
+        status = "OK" if tg.in_sync else "DRIFT"
+        lines.append(f"{tg.name:40} {status}")
+    lines.append("")
+
+    # Load Balancer Drift
+    lines.append("LOAD BALANCER DRIFT")
+    lines.append("-" * 70)
+    for lb in lb_audits:
+        if lb.in_sync:
+            continue
+        lines.append(f"{lb.name} – {lb.action}")
+        for d in lb.drift:
+            lines.append(f"  • {d.field}: {d.source_value} → {d.target_value}")
+        for n in lb.notes:
+            lines.append(f"  Note: {n}")
+        lines.append("")
+    lines.append("")
+
+    # Listener Drift
+    lines.append("LISTENER DRIFT")
+    lines.append("-" * 70)
+    for ls in listener_audits:
+        if ls.in_sync:
+            continue
+        lines.append(f"{ls.name} – {ls.action}")
+        for d in ls.drift:
+            lines.append(f"  • {d.field}: {d.source_value} → {d.target_value}")
+        for n in ls.notes:
+            lines.append(f"  Note: {n}")
+        lines.append("")
+    lines.append("")
+
+    # Write file
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+
+def cert_display_name_hybrid(cert):
+    """Return a hybrid human-friendly certificate name: domain + ARN suffix."""
+    if not cert:
+        return "UNKNOWN-CERT"
+
+    domain = getattr(cert, "DomainName", None)
+    sans = getattr(cert, "SubjectAlternativeNames", [])
+    arn = getattr(cert, "CertificateArn", "")
+
+    # Extract ARN suffix
+    suffix = arn.split("/")[-1] if arn else "unknown"
+
+    # Prefer primary domain
+    if domain:
+        return f"{domain} ({suffix})"
+
+    # Fallback to first SAN
+    if sans:
+        return f"{sans[0]} ({suffix})"
+
+    # Fallback to suffix only
+    return suffix
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -2005,7 +2154,7 @@ def main() -> int:
             f"rules={sum(len(v) for v in target.listener_rules.values())}, TGs={len(target.target_groups)}, certs={len(target.certificates)}"
         )
 
-        ctx = build_match_context(source, target, allow_legacy=args.allow_legacy)
+        ctx = build_match_context(source, target, allow_legacy=args.allow_legacy, policy=policy)
 
         tg_audits = audit_target_groups(source, target, ctx, policy)
         lb_audits = audit_load_balancers(source, target, ctx, policy)
@@ -2052,6 +2201,23 @@ def main() -> int:
         report_path = resolve_report_path(args, config)
         write_json(report_path, report_payload)
         log(f"[REPORT] Written: {report_path}")
+
+        # -------------------------------------------------------------------------
+        # HUMAN‑READABLE REPORT
+        # -------------------------------------------------------------------------
+        human_report_path = report_path.replace(".json", ".txt")
+        write_human_report(
+            human_report_path,
+            report_payload["summary"],
+            tg_audits,
+            lb_audits,
+            listener_audits,
+            rule_audits,
+            ctx
+        )
+        log(f"[REPORT] Human-readable report written: {human_report_path}")
+        # -------------------------------------------------------------------------
+
         log("[DONE] ELBv2 DR routing reconciliation complete.")
         return 0
 
