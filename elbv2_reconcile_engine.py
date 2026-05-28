@@ -1158,41 +1158,40 @@ def rule_key(rule: ListenerRuleState) -> str:
     return json.dumps(rule.conditions, sort_keys=True)
 
 
-def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: MatchContext, policy: Policy) -> Tuple[List[ResourceAudit], List[ResourceAudit]]:
+def audit_listeners_and_rules(
+    source: WorldState,
+    target: WorldState,
+    ctx: MatchContext,
+    policy: Policy,
+) -> Tuple[List[ResourceAudit], List[ResourceAudit]]:
     listener_audits: List[ResourceAudit] = []
     rule_audits: List[ResourceAudit] = []
 
-    # Helper for hybrid certificate display
-    def _hybrid_cert_name_from_arn(arn: str) -> str:
-        """Return domain + ARN suffix for readability."""
-        suffix = arn.split("/")[-1]
-
-        # Find cert in source
-        cert = None
-        for c in source.certificates.values():
-            if c.arn == arn:
-                cert = c
-                break
-
-        if not cert:
-            return suffix
-
-        domain = getattr(cert, "DomainName", None)
-        sans = getattr(cert, "SubjectAlternativeNames", [])
-
-        if domain:
-            return f"{domain} ({suffix})"
-        if sans:
-            return f"{sans[0]} ({suffix})"
-
-        return suffix
-
     target_listener_index_by_lb: Dict[str, Dict[str, ListenerState]] = {}
     for listener in target.listeners.values():
-        target_listener_index_by_lb.setdefault(listener.load_balancer_arn, {})[listener_key(listener)] = listener
+        target_listener_index_by_lb.setdefault(
+            listener.load_balancer_arn, {}
+        )[listener_key(listener)] = listener
+
+    # Helper: resolve a human-friendly certificate name from ARN
+    def _cert_name_from_arn(arn: str) -> str:
+        """Return DomainName or first SAN for readability."""
+        for c in source.certificates.values():
+            if c.arn == arn:
+                domain = getattr(c, "DomainName", None)
+                sans = getattr(c, "SubjectAlternativeNames", [])
+                if domain:
+                    return domain
+                if sans:
+                    return sans[0]
+                return arn.split("/")[-1]  # fallback to suffix
+        return arn.split("/")[-1]
 
     for src_lb_arn, tgt_lb_arn in sorted(ctx.lb_source_to_target_arn.items()):
-        source_listeners = [ls for ls in source.listeners.values() if ls.load_balancer_arn == src_lb_arn]
+        source_listeners = [
+            ls for ls in source.listeners.values()
+            if ls.load_balancer_arn == src_lb_arn
+        ]
         target_listener_index = target_listener_index_by_lb.get(tgt_lb_arn, {})
 
         for src_listener in sorted(source_listeners, key=lambda x: (x.port, x.protocol)):
@@ -1208,11 +1207,13 @@ def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: Match
             )
 
             # ---------------------------------------------------------
-            # CERTIFICATE REMAP + HYBRID DISPLAY PATCH
+            # CERTIFICATE REMAP + HUMAN-FRIENDLY DISPLAY
             # ---------------------------------------------------------
-            desired_cert_arns, cert_notes = remap_certificates(src_listener.certificates, ctx)
+            desired_cert_arns, cert_notes = remap_certificates(
+                src_listener.certificates, ctx
+            )
 
-            new_cert_notes = []
+            new_cert_notes: List[str] = []
             for note in cert_notes:
                 arn = None
                 for token in note.split():
@@ -1221,15 +1222,27 @@ def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: Match
                         break
 
                 if arn:
-                    hybrid = _hybrid_cert_name_from_arn(arn)
-                    new_cert_notes.append(note.replace(arn, hybrid))
+                    name = _cert_name_from_arn(arn)
+
+                    prefix = note.split(" arn:")[0].strip().lower()
+
+                    if "expired" in prefix:
+                        new_cert_notes.append(f"DR certificate for {name} is EXPIRED")
+                    else:
+                        new_cert_notes.append(f"No DR ACM certificate match for source certificate {name}")
+
+                    # Add ARN as its own note line
+                    new_cert_notes.append(f"ARN: {arn}")
+
                 else:
                     new_cert_notes.append(note)
 
             cert_notes = new_cert_notes
             # ---------------------------------------------------------
 
-            desired_actions, action_notes = remap_actions(src_listener.default_actions, ctx)
+            desired_actions, action_notes = remap_actions(
+                src_listener.default_actions, ctx
+            )
 
             for n in cert_notes + action_notes:
                 la.notes.append(n)
@@ -1243,13 +1256,33 @@ def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: Match
 
             drift: List[FieldDrift] = []
             if src_listener.ssl_policy != tgt_listener.ssl_policy:
-                drift.append(FieldDrift("SslPolicy", src_listener.ssl_policy, tgt_listener.ssl_policy))
+                drift.append(
+                    FieldDrift(
+                        "SslPolicy",
+                        src_listener.ssl_policy,
+                        tgt_listener.ssl_policy,
+                    )
+                )
 
-            if desired_cert_arns and sorted(desired_cert_arns) != sorted(tgt_listener.certificates):
-                drift.append(FieldDrift("Certificates", desired_cert_arns, tgt_listener.certificates))
+            if desired_cert_arns and sorted(desired_cert_arns) != sorted(
+                tgt_listener.certificates
+            ):
+                drift.append(
+                    FieldDrift(
+                        "Certificates",
+                        desired_cert_arns,
+                        tgt_listener.certificates,
+                    )
+                )
 
             if desired_actions != canonicalize_actions(tgt_listener.default_actions):
-                drift.append(FieldDrift("DefaultActions", desired_actions, canonicalize_actions(tgt_listener.default_actions)))
+                drift.append(
+                    FieldDrift(
+                        "DefaultActions",
+                        desired_actions,
+                        canonicalize_actions(tgt_listener.default_actions),
+                    )
+                )
 
             la.drift.extend(drift)
 
@@ -1266,8 +1299,16 @@ def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: Match
             if not policy.sync_listener_rules:
                 continue
 
-            source_rules = [r for r in source.listener_rules.get(src_listener.arn, []) if not r.is_default]
-            target_rules = [r for r in target.listener_rules.get(tgt_listener.arn, []) if not r.is_default]
+            source_rules = [
+                r
+                for r in source.listener_rules.get(src_listener.arn, [])
+                if not r.is_default
+            ]
+            target_rules = [
+                r
+                for r in target.listener_rules.get(tgt_listener.arn, [])
+                if not r.is_default
+            ]
             target_rule_index = {rule_key(r): r for r in target_rules}
 
             for src_rule in sorted(source_rules, key=lambda x: x.priority):
@@ -1293,9 +1334,24 @@ def audit_listeners_and_rules(source: WorldState, target: WorldState, ctx: Match
 
                 drift: List[FieldDrift] = []
                 if desired_actions != canonicalize_actions(tgt_rule.actions):
-                    drift.append(FieldDrift("Actions", desired_actions, canonicalize_actions(tgt_rule.actions)))
-                if canonicalize_conditions(src_rule.conditions) != canonicalize_conditions(tgt_rule.conditions):
-                    drift.append(FieldDrift("Conditions", canonicalize_conditions(src_rule.conditions), canonicalize_conditions(tgt_rule.conditions)))
+                    drift.append(
+                        FieldDrift(
+                            "Actions",
+                            desired_actions,
+                            canonicalize_actions(tgt_rule.actions),
+                        )
+                    )
+
+                if canonicalize_conditions(src_rule.conditions) != canonicalize_conditions(
+                    tgt_rule.conditions
+                ):
+                    drift.append(
+                        FieldDrift(
+                            "Conditions",
+                            canonicalize_conditions(src_rule.conditions),
+                            canonicalize_conditions(tgt_rule.conditions),
+                        )
+                    )
 
                 ra.drift.extend(drift)
 
